@@ -694,12 +694,17 @@ class MetatomicCoreDriver(Dummy_driver):
             factor = self.pair_capacity_factor
             jx["capacity"] = [math.ceil(factor * len(i)) + 1, math.ceil(factor * count)]
         overflow = jx["overflow"] is not None and bool(jx["overflow"])
-        while len(i) >= jx["capacity"][0] or count > jx["capacity"][1] or overflow:
-            jx["capacity"] = [math.ceil(1.5 * c) for c in jx["capacity"]]
-            jx["fn"], jx["regrowths"], overflow = None, jx["regrowths"] + 1, False
+        # grow only what overflowed: the pairs, or the per-atom edges (PET's flag)
+        grow = [len(i) >= jx["capacity"][0], count > jx["capacity"][1] or overflow]
+        while any(grow):
+            jx["capacity"] = [
+                math.ceil(1.5 * c) if g else c for c, g in zip(jx["capacity"], grow)
+            ]
+            jx["fn"], jx["regrowths"] = None, jx["regrowths"] + 1
             info(
                 f"metatomic_core: pair capacity grown to {jx['capacity']}", self.verbose
             )
+            grow = [len(i) >= jx["capacity"][0], count > jx["capacity"][1]]
         if jx["fn"] is None:
             jx["fn"] = self.model.jax_energy_function(
                 self._types, pbc, jx["capacity"][1]
