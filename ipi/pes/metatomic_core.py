@@ -531,16 +531,14 @@ class MetatomicCoreDriver(Dummy_driver):
             ],
             np.column_stack([i, j, S]).astype(np.int32).reshape(-1, 5),
         )
-        return dict(
-            skin=skin,
-            host=(i, j, S),
-            samples=samples,
-            i=jnp.asarray(i.astype(np.int32)),
-            j=jnp.asarray(j.astype(np.int32)),
-            S=jnp.asarray(S.astype(x.dtype)),
-            x=x,
-            c=c,
-        )
+        nl = dict(skin=skin, host=(i, j, S), samples=samples, x=x, c=c)
+        if not self._jx["padded"]:  # the padded path uses the model's own arrays
+            nl.update(
+                i=jnp.asarray(i.astype(np.int32)),
+                j=jnp.asarray(j.astype(np.int32)),
+                S=jnp.asarray(S.astype(x.dtype)),
+            )
+        return nl
 
     def _moved(self, nl, x, c):
         """Whether an atom moved, or the cell changed, by more than half the skin
