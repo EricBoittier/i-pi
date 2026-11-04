@@ -30,6 +30,7 @@ into the buffers of the compiled function.
 
 import functools
 import os
+import threading
 
 import numpy as np
 
@@ -37,7 +38,19 @@ from ipi.utils import depend
 from ipi.utils.jit import WARMUP_CALLS, JitError, _Recorder
 from ipi.utils.messages import info, verbosity, warning
 
-__all__ = ["JitReplay"]
+__all__ = ["JitReplay", "in_untraced_call"]
+
+_untraced = threading.local()
+
+
+def in_untraced_call():
+    """Whether the calling code runs in an untraced eager call within a compiled
+    step. On a GPU, such code must not compile new XLA functions with the default
+    options: XLA's autotuning runs on the device, which waits for the call, and
+    deadlocks. Code that compiles there should disable it, e.g. with
+    ``jax.jit(f).lower(...).compile({"xla_gpu_autotune_level": 0})``."""
+
+    return getattr(_untraced, "active", False)
 
 
 class JitReplay:
@@ -132,7 +145,9 @@ class JitReplay:
 
                 def split(key, donated, kept):
                     d, k = iter(donated), iter(kept)
-                    return traced(key, [next(d) if m else next(k) for m in self.donated])
+                    return traced(
+                        key, [next(d) if m else next(k) for m in self.donated]
+                    )
 
                 parts = self._split(arrays)
                 self.compiled = (
@@ -307,7 +322,11 @@ def _untraced_call(func, args, template):
         views = list(leaves)
         for i, buffer in zip(traced, buffers):
             views[i] = jnp.from_dlpack(buffer)
-        values = tree.tree_leaves(func(*tree.tree_unflatten(treedef, views)))
+        _untraced.active = True
+        try:
+            values = tree.tree_leaves(func(*tree.tree_unflatten(treedef, views)))
+        finally:
+            _untraced.active = False
         if any(
             not _equal(values[i], fixed[i])
             for i in range(len(fixed))
