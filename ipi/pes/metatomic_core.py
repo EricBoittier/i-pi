@@ -88,7 +88,11 @@ class MetatomicCoreDriver(Dummy_driver):
     compiled function whose pair arrays are padded to a fixed capacity
     (``pair_capacity_factor`` times the first list, 0 to disable): rebuilding
     the list then re-uses the compiled function, which is only re-compiled when
-    the capacity overflows (growing by 1.5).
+    the capacity overflows (growing by 1.5). With ``device_rebuild=true`` (and a
+    model that provides ``jax_device_pairs``), the half-skin check and the
+    rebuild run on the device too, in the same compiled call, so that only the
+    overflow flag is read, every ``nl_check`` calls (brute force over the
+    periodic images: small systems).
     """
 
     def __init__(
@@ -106,6 +110,7 @@ class MetatomicCoreDriver(Dummy_driver):
         nl_check=1,
         trace=False,
         pair_capacity_factor=1.3,
+        device_rebuild=False,
         *args,
         **kwargs,
     ):
@@ -145,6 +150,7 @@ class MetatomicCoreDriver(Dummy_driver):
         self.traceable = _as_bool(trace)
         self.nl_check = max(int(nl_check), 1)
         self.pair_capacity_factor = float(pair_capacity_factor)
+        self.device_rebuild = _as_bool(device_rebuild)
         super().__init__(*args, **kwargs)
 
     def check_parameters(self):
@@ -431,17 +437,41 @@ class MetatomicCoreDriver(Dummy_driver):
         if jx["lists"][0] is not None and self._pbc.any():
             # undo the folding of the positions into the cell since the list was
             # built (e.g. ffdirect pbc=true), which would invalidate its shifts
-            x_ref = jx["lists"][0]["x"]
+            device = jx.get("device")
+            x_ref = jx["lists"][0]["x"] if device is None else device["state"]["x"]
             x = x - jnp.round((x - x_ref) @ jnp.linalg.inv(c)) @ c
         if not traced:
             jx["calls"] += 1
             check = jx["calls"] % self.nl_check == 0
+            if jx.get("device") is not None:
+                # rebuilds run on the device: only the overflow flag is read here
+                if check and bool(jx["overflow"]):
+                    jx["device"] = None
+                    jx["lists"][0] = self._verlet(0, x, c)
+                    jx["rebuilds"] += 1
+                    self._pad(jx["lists"][0])
+                check = False
             for k, nl in enumerate(jx["lists"]):
+                if jx.get("device") is not None:
+                    break
                 if nl is None or nl["skin"] == 0 or (check and self._moved(nl, x, c)):
                     jx["lists"][k] = self._verlet(k, x, c)
                     jx["rebuilds"] += 1
                     if jx["padded"]:
                         self._pad(jx["lists"][k])
+        if jx["padded"] and self.device_rebuild and jx["fn"] is not None:
+            if jx.get("device") is None:
+                self._device_step(jx["lists"][0])
+            out = jx["device"]["call"](x, c, jx["device"]["state"])
+            e, f, v, overflow, jx["device"]["state"] = out
+            jx["overflow"] = overflow
+            v = (v + v.T) * jx["half"]
+            return (
+                e * jx["energy"],
+                (f * jx["force"]).reshape(pos.shape),
+                v.T * jx["energy"],
+                "",
+            )
         if jx["padded"]:
             e, f, v, jx["overflow"] = jx["fn"](x, c, **jx["lists"][0]["pairs"])
             v = (v + v.T) * jx["half"]
@@ -550,6 +580,54 @@ class MetatomicCoreDriver(Dummy_driver):
         if self._jx["overflow"] is not None:  # PET's per-atom edge capacity
             moved = moved | self._jx["overflow"]
         return bool(moved)
+
+    def _device_step(self, nl):
+        """One compiled call with the half-skin check and the rebuild on the device:
+        (positions, cell, state) -> (energy, forces, virial, overflow, state), the
+        state holding the pair arrays, the reference positions and cell, and the
+        number of rebuilds"""
+        import jax
+        import jax.numpy as jnp
+
+        jx = self._jx
+        options = self._pair_lists[0]
+        length = mta.unit_conversion_factor(
+            self.model.capabilities().length_unit, "angstrom"
+        )
+        build = self.model.jax_device_pairs(
+            len(self._types),
+            jx["capacity"][0],
+            options.cutoff * length + self.skin,
+            bool(self._pbc.any()),
+        )
+        energy, half_skin = jx["fn"], jx["half_skin"]
+
+        @jax.jit
+        def call(x, c, state):
+            moved = jnp.max(jnp.abs(x - state["x"])) + jnp.max(jnp.abs(c - state["c"]))
+
+            def rebuild(_):
+                arrays, overflow = build(x, c)
+                return dict(
+                    arrays=arrays,
+                    x=x,
+                    c=c,
+                    overflow=overflow,
+                    rebuilds=state["rebuilds"] + 1,
+                )
+
+            state = jax.lax.cond(moved > half_skin, rebuild, lambda s: s, state)
+            e, f, v, overflow = energy(x, c, **state["arrays"])
+            return e, f, v, overflow | state["overflow"], state
+
+        state = dict(
+            arrays=nl["pairs"],
+            x=nl["x"],
+            c=nl["c"],
+            overflow=jnp.zeros((), bool),
+            rebuilds=jnp.zeros((), jnp.int32),
+        )
+        jx["device"] = dict(call=call, state=state)
 
     def _pad(self, nl):
         """The pair arrays of the Verlet list `nl` padded to the capacity of the
