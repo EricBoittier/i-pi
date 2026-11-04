@@ -257,6 +257,14 @@ class MetatomicCoreDriver(Dummy_driver):
             return jnp.asarray(x)
         return x
 
+    def _labels(self, names, values):
+        # torch blocks need their Labels on the same device as the values
+        if self.array == "torch":
+            import torch
+
+            values = torch.as_tensor(values, device=self.device)
+        return metatensor.Labels(names, values)
+
     def _system(self, cell, pos):
         positions = unit_to_user("length", "angstrom", pos).reshape(-1, 3)
         # i-PI stores cell vectors as columns, metatomic as rows
@@ -281,7 +289,7 @@ class MetatomicCoreDriver(Dummy_driver):
                 quantities="ijSD",
                 copy=True,
             )
-            samples = metatensor.Labels(
+            samples = self._labels(
                 [
                     "first_atom",
                     "second_atom",
@@ -294,8 +302,8 @@ class MetatomicCoreDriver(Dummy_driver):
             pairs = metatensor.TensorBlock(
                 self._arr(vectors, self._dtype).reshape(-1, 3, 1),
                 samples,
-                [metatensor.Labels.range("xyz", 3)],
-                metatensor.Labels.range("distance", 1),
+                [self._labels(["xyz"], np.arange(3, dtype=np.int32)[:, None])],
+                self._labels(["distance"], np.zeros((1, 1), dtype=np.int32)),
             )
             system.add_pairs(options, pairs)
         return system
