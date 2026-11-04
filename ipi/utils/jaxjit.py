@@ -29,6 +29,7 @@ into the buffers of the compiled function.
 # See the "licenses" directory for full license information.
 
 import functools
+import os
 
 import numpy as np
 
@@ -122,6 +123,25 @@ class JitReplay:
 
         try:
             self.compiled = jax.jit(traced).lower(key, arrays).compile()
+            self.donated = None
+            if os.environ.get("IPI_JAX_DONATE"):
+                # experimental: donate the buffers of the inputs that the step
+                # overwrites (e.g. positions and momenta), found by the first trace
+                written = {id(dep._root()) for dep in self.outputs}
+                self.donated = [id(dep._root()) in written for dep in self.arrays]
+
+                def split(key, donated, kept):
+                    d, k = iter(donated), iter(kept)
+                    return traced(key, [next(d) if m else next(k) for m in self.donated])
+
+                parts = self._split(arrays)
+                self.compiled = (
+                    jax.jit(split, donate_argnums=(1,)).lower(key, *parts).compile()
+                )
+                info(
+                    f" @jaxjit: donating {sum(self.donated)} of {len(arrays)} inputs",
+                    verbosity.low,
+                )
         except Exception as err:
             raise JitError(
                 "The step cannot be compiled with jax.jit: run i-PI without --jit"
@@ -163,7 +183,10 @@ class JitReplay:
 
         import jax
 
-        key, results = self.compiled(key, arrays)
+        if self.donated is not None:
+            key, results = self.compiled(key, *self._split(arrays))
+        else:
+            key, results = self.compiled(key, arrays)
         if key is not None:
             self.prng._jax_key = key
         results = iter(results)
@@ -172,6 +195,20 @@ class JitReplay:
             self.outputs, jax.tree_util.tree_unflatten(self.treedef, leaves)
         ):
             dep._store(value)
+
+    def _split(self, arrays):
+        """The inputs that are donated, and the others"""
+
+        import jax.numpy as jnp
+
+        kept = [a for a, m in zip(arrays, self.donated) if not m]
+        seen, donated = {id(a) for a in kept}, []
+        for a, m in zip(arrays, self.donated):
+            if m:
+                # an array held by several depend objects is donated once
+                donated.append(jnp.copy(a) if id(a) in seen else a)
+                seen.add(id(a))
+        return donated, kept
 
     def replay(self):
         """Calls the compiled function on the current values of the inputs, and
