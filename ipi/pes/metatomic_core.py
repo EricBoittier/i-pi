@@ -606,8 +606,9 @@ class MetatomicCoreDriver(Dummy_driver):
         compiled step (an untraced eager call, see ipi.utils.jaxjit): there, XLA's
         GPU autotuning would deadlock, so it is disabled for this executable (e.g.
         a function re-compiled for a larger pair capacity)"""
-        ran = jx.setdefault("ran", set())
-        if id(fn) in ran or not hasattr(fn, "lower"):
+        # functions that ran, kept alive: an id() could be re-used by a new function
+        ran = jx.setdefault("ran", [])
+        if any(f is fn for f in ran) or not hasattr(fn, "lower"):
             return fn
         try:
             from ipi.utils.jaxjit import in_untraced_call
@@ -616,7 +617,7 @@ class MetatomicCoreDriver(Dummy_driver):
         if in_untraced_call():
             options = {"xla_gpu_autotune_level": 0}
             fn = fn.lower(*args, **kwargs).compile(compiler_options=options)
-        ran.add(id(fn))
+        ran.append(fn)
         return fn
 
     def _device_step(self, nl):
