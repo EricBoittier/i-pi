@@ -81,8 +81,8 @@ class MetatomicCoreDriver(Dummy_driver):
     compiled steps, unless ``trace=true``: a JAX model is then traced in the
     compiled step (through ``JaxModel.evaluate``) with the pair list of the last
     eager call, which must remain valid (e.g. a molecule within the cutoff).
-    Models must accept pairs beyond their cutoff (``strict=False`` pair lists),
-    as the Verlet list contains them; ``skin=0`` rebuilds the list at each call.
+    Pair lists that the model requests as ``strict`` get no skin, i.e. are
+    rebuilt at each call with exactly the pairs within the cutoff.
     A JAX model that provides ``jax_pair_arrays`` and ``jax_energy_function``
     (padded pair arrays as data, e.g. the pet-jax adapter) is called through a
     compiled function whose pair arrays are padded to a fixed capacity
@@ -437,7 +437,7 @@ class MetatomicCoreDriver(Dummy_driver):
             jx["calls"] += 1
             check = jx["calls"] % self.nl_check == 0
             for k, nl in enumerate(jx["lists"]):
-                if nl is None or self.skin == 0 or (check and self._moved(nl, x, c)):
+                if nl is None or nl["skin"] == 0 or (check and self._moved(nl, x, c)):
                     jx["lists"][k] = self._verlet(k, x, c)
                     jx["rebuilds"] += 1
                     if jx["padded"]:
@@ -510,8 +510,10 @@ class MetatomicCoreDriver(Dummy_driver):
         length = mta.unit_conversion_factor(
             self.model.capabilities().length_unit, "angstrom"
         )
+        # a strict pair list must hold exactly the pairs within the cutoff
+        skin = 0.0 if options.strict else self.skin
         i, j, S = vesin.NeighborList(
-            cutoff=options.cutoff * length + self.skin, full_list=options.full_list
+            cutoff=options.cutoff * length + skin, full_list=options.full_list
         ).compute(
             points=np.asarray(x),
             box=np.asarray(c),
@@ -530,6 +532,7 @@ class MetatomicCoreDriver(Dummy_driver):
             np.column_stack([i, j, S]).astype(np.int32).reshape(-1, 5),
         )
         return dict(
+            skin=skin,
             host=(i, j, S),
             samples=samples,
             i=jnp.asarray(i.astype(np.int32)),

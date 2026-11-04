@@ -90,3 +90,27 @@ def test_native_plugin_matches_python_model(argon):
     )
     assert np.isclose(e_native, e_python)
     assert np.allclose(f_native, f_python, atol=1e-12)
+
+
+@pytest.mark.parametrize("skin", [0.0, 1.0])
+def test_backend_arrays_match_numpy_arrays(argon, skin):
+    """array=backend works on JAX arrays, and gives the results of the numpy
+    path (the test model's pair list is strict, so no skin is used for it)"""
+
+    jax = pytest.importorskip("jax")
+    jax.config.update("jax_enable_x64", True)
+    atoms, path = argon
+    options = dict(template=str(path / "argon.xyz"), model=str(path / "model.py:model"))
+    reference = MetatomicCoreDriver(**options)
+    driver = MetatomicCoreDriver(**options, array="backend", skin=skin)
+    assert driver.backend_arrays and not driver.traceable
+    cell, pos = _ipi(atoms)
+    expected = reference(cell, pos)
+    for moved in (0.0, 0.3):  # the second call moves atoms by more than skin/2
+        cell, pos = _ipi(atoms)
+        pos = pos + unit_to_internal("length", "angstrom", moved)
+        expected = reference(cell, pos)
+        results = driver(jax.numpy.asarray(cell), jax.numpy.asarray(pos))
+        assert all(isinstance(r, jax.Array) for r in results[:3])
+        for value, ref in zip(results[:3], expected[:3]):
+            np.testing.assert_allclose(np.asarray(value), ref, rtol=1e-12, atol=1e-14)
