@@ -431,6 +431,15 @@ class MetatomicCoreDriver(Dummy_driver):
                 regrowths=0,
             )
         jx = self._jx
+        if jx["calls"] == 0 and not jx["padded"] and not self.traceable:
+            if isinstance(self.model, mta.JaxModel) and jax.default_backend() == "gpu":
+                warning(
+                    "metatomic_core: this JAX model re-compiles when its pair list "
+                    "changes; within steps compiled with --jit on a GPU, compiling "
+                    "deadlocks (XLA's autotuning needs the device). Use a model with "
+                    "padded pair arrays, trace=true, or XLA_FLAGS="
+                    "--xla_gpu_autotune_level=0"
+                )
         x = pos.reshape(-1, 3) * jx["length"]
         c = jnp.where(jx["pbc"][:, None], cell.T * jx["length"], jx["zero"])
         traced = isinstance(x, jax.core.Tracer)
@@ -463,7 +472,11 @@ class MetatomicCoreDriver(Dummy_driver):
         if jx["padded"] and self.device_rebuild and jx["fn"] is not None:
             if jx.get("device") is None:
                 self._device_step(jx["lists"][0])
-            out = jx["device"]["call"](x, c, jx["device"]["state"])
+            device = jx["device"]
+            device["call"] = self._safe_compile(
+                jx, device["call"], x, c, device["state"]
+            )
+            out = device["call"](x, c, device["state"])
             e, f, v, overflow, jx["device"]["state"] = out
             jx["overflow"] = overflow
             v = (v + v.T) * jx["half"]
@@ -474,7 +487,9 @@ class MetatomicCoreDriver(Dummy_driver):
                 "",
             )
         if jx["padded"]:
-            e, f, v, jx["overflow"] = jx["fn"](x, c, **jx["lists"][0]["pairs"])
+            pairs = jx["lists"][0]["pairs"]
+            jx["fn"] = self._safe_compile(jx, jx["fn"], x, c, **pairs)
+            e, f, v, jx["overflow"] = jx["fn"](x, c, **pairs)
             v = (v + v.T) * jx["half"]
             return (
                 e * jx["energy"],
@@ -584,6 +599,25 @@ class MetatomicCoreDriver(Dummy_driver):
         if self._jx["overflow"] is not None:  # PET's per-atom edge capacity
             moved = moved | self._jx["overflow"]
         return bool(moved)
+
+    @staticmethod
+    def _safe_compile(jx, fn, *args, **kwargs):
+        """`fn`, compiled ahead of time if it never ran and is called within a
+        compiled step (an untraced eager call, see ipi.utils.jaxjit): there, XLA's
+        GPU autotuning would deadlock, so it is disabled for this executable (e.g.
+        a function re-compiled for a larger pair capacity)"""
+        ran = jx.setdefault("ran", set())
+        if id(fn) in ran or not hasattr(fn, "lower"):
+            return fn
+        try:
+            from ipi.utils.jaxjit import in_untraced_call
+        except ImportError:
+            in_untraced_call = lambda: False  # noqa: E731
+        if in_untraced_call():
+            options = {"xla_gpu_autotune_level": 0}
+            fn = fn.lower(*args, **kwargs).compile(compiler_options=options)
+        ran.add(id(fn))
+        return fn
 
     def _device_step(self, nl):
         """One compiled call with the half-skin check and the rebuild on the device:
