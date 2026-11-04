@@ -68,6 +68,27 @@ class MetatomicCoreDriver(Dummy_driver):
             round-trip for models that run on a GPU (TorchScript, JAX); native
             plugins copy host arrays to their own device.
         :param device: str, optional, torch device for ``array=torch`` (default cuda)
+
+    With ``array=backend``, the driver works directly on the arrays of the i-PI
+    array backend (``i-pi --backend jax``, in-process ``ffdirect`` only), which
+    stay on their device: the positions are given to the model, and the forces
+    returned to i-PI, without copies or host transfers. The pairs come from a
+    Verlet list (cutoff + ``skin``) whose indices are kept on the device, and
+    which is rebuilt (on the host, with vesin) when an atom has moved by more
+    than half the skin, or the cell changed by as much. This is checked every
+    ``nl_check`` calls, reading one number from the device: the other calls make
+    no host transfer. With ``--jit``, the driver is called eagerly within the
+    compiled steps, unless ``trace=true``: a JAX model is then traced in the
+    compiled step (through ``JaxModel.evaluate``) with the pair list of the last
+    eager call, which must remain valid (e.g. a molecule within the cutoff).
+    Models must accept pairs beyond their cutoff (``strict=False`` pair lists),
+    as the Verlet list contains them; ``skin=0`` rebuilds the list at each call.
+    A JAX model that provides ``jax_pair_arrays`` and ``jax_energy_function``
+    (padded pair arrays as data, e.g. the pet-jax adapter) is called through a
+    compiled function whose pair arrays are padded to a fixed capacity
+    (``pair_capacity_factor`` times the first list, 0 to disable): rebuilding
+    the list then re-uses the compiled function, which is only re-compiled when
+    the capacity overflows (growing by 1.5).
     """
 
     def __init__(
@@ -82,6 +103,9 @@ class MetatomicCoreDriver(Dummy_driver):
         skin=2.0,
         array="numpy",
         device="cuda",
+        nl_check=1,
+        trace=False,
+        pair_capacity_factor=1.3,
         *args,
         **kwargs,
     ):
@@ -113,8 +137,14 @@ class MetatomicCoreDriver(Dummy_driver):
         self.skin = float(skin)
         self.array = str(array)
         self.device = str(device)
-        if self.array not in ("numpy", "torch", "jax"):
-            raise ValueError(f"array must be numpy, torch or jax, got {self.array}")
+        if self.array not in ("numpy", "torch", "jax", "backend"):
+            raise ValueError(
+                f"array must be numpy, torch, jax or backend, got {self.array}"
+            )
+        self.backend_arrays = self.array == "backend"
+        self.traceable = _as_bool(trace)
+        self.nl_check = max(int(nl_check), 1)
+        self.pair_capacity_factor = float(pair_capacity_factor)
         super().__init__(*args, **kwargs)
 
     def check_parameters(self):
@@ -310,6 +340,12 @@ class MetatomicCoreDriver(Dummy_driver):
 
     def compute(self, cell, pos):
         """Evaluates one structure, or a list of structures in a single model call"""
+        if self.backend_arrays and not isinstance(
+            pos if not isinstance(pos, list) else pos[0], np.ndarray
+        ):
+            if isinstance(cell, list):
+                return [self._native(c, p) for c, p in zip(cell, pos)]
+            return self._native(cell, pos)
         batched = isinstance(cell, list)
         cells, positions = (cell, pos) if batched else ([cell], [pos])
         if len(cells) != len(positions):
@@ -359,3 +395,189 @@ class MetatomicCoreDriver(Dummy_driver):
 
     def compute_structure(self, cell, pos):
         return self.compute(cell, pos)
+
+    def _native(self, cell, pos):
+        """One structure, as JAX arrays of the i-PI backend (see ``array=backend``)"""
+        import jax
+        import jax.numpy as jnp
+
+        if not hasattr(self, "_jx"):
+            constant = lambda value: jnp.asarray(value)  # noqa: E731
+            self._jx = dict(
+                length=constant(unit_to_user("length", "angstrom", 1.0)),
+                energy=constant(unit_to_internal("energy", "electronvolt", 1.0)),
+                force=constant(unit_to_internal("force", "ev/ang", 1.0)),
+                types=jnp.asarray(self._types),
+                pbc=jnp.asarray(self._pbc),
+                zero=jnp.zeros(()),
+                half=constant(0.5),
+                half_skin=constant(self.skin / 2),
+                lists=[None] * len(self._pair_lists),
+                calls=0,
+                padded=self.pair_capacity_factor > 0
+                and len(self._pair_lists) == 1
+                and hasattr(self.model, "jax_energy_function"),
+                fn=None,
+                capacity=None,
+                overflow=None,
+                compiles=0,
+                rebuilds=0,
+                regrowths=0,
+            )
+        jx = self._jx
+        x = pos.reshape(-1, 3) * jx["length"]
+        c = jnp.where(jx["pbc"][:, None], cell.T * jx["length"], jx["zero"])
+        traced = isinstance(x, jax.core.Tracer)
+        if jx["lists"][0] is not None and self._pbc.any():
+            # undo the folding of the positions into the cell since the list was
+            # built (e.g. ffdirect pbc=true), which would invalidate its shifts
+            x_ref = jx["lists"][0]["x"]
+            x = x - jnp.round((x - x_ref) @ jnp.linalg.inv(c)) @ c
+        if not traced:
+            jx["calls"] += 1
+            check = jx["calls"] % self.nl_check == 0
+            for k, nl in enumerate(jx["lists"]):
+                if nl is None or self.skin == 0 or (check and self._moved(nl, x, c)):
+                    jx["lists"][k] = self._verlet(k, x, c)
+                    jx["rebuilds"] += 1
+                    if jx["padded"]:
+                        self._pad(jx["lists"][k])
+        if jx["padded"]:
+            e, f, v, jx["overflow"] = jx["fn"](x, c, **jx["lists"][0]["pairs"])
+            v = (v + v.T) * jx["half"]
+            return (
+                e * jx["energy"],
+                (f * jx["force"]).reshape(pos.shape),
+                v.T * jx["energy"],
+                "",
+            )
+        pairs = [
+            (options, nl["samples"], x[nl["j"]] - x[nl["i"]] + nl["S"] @ c)
+            for options, nl in zip(self._pair_lists, jx["lists"])
+        ]
+        if traced:
+            system = mta.JaxSystem(
+                self._types,
+                x,
+                c,
+                self._pbc,
+                pairs={o: (s, v.reshape(-1, 3, 1)) for o, s, v in pairs},
+            )
+            (energy,) = self.model.evaluate([system], [self._energy])
+        else:
+            system = mta.System("angstrom", jx["types"], x, c, jx["pbc"])
+            for options, samples, vectors in pairs:
+                system.add_pairs(
+                    options,
+                    metatensor.TensorBlock(
+                        vectors.reshape(-1, 3, 1),
+                        samples,
+                        [metatensor.Labels.range("xyz", 3)],
+                        metatensor.Labels.range("distance", 1),
+                    ),
+                )
+            (energy,) = mta.execute_model(
+                self.model,
+                [system],
+                [self._energy],
+                check_consistency=self.check_consistency,
+            )
+        block = energy.block()
+        gradient = block.gradient("positions")
+        atoms = np.asarray(gradient.samples.column("atom"))
+        forces = -gradient.values[..., 0]
+        if not np.array_equal(atoms, np.arange(len(self._types))):
+            forces = (
+                jnp.zeros((len(self._types), 3), forces.dtype).at[atoms].add(forces)
+            )
+        virial = jnp.zeros((3, 3), forces.dtype)
+        if "strain" in block.gradients_list():
+            virial = -block.gradient("strain").values[..., 0].sum(axis=0)
+            virial = (virial + virial.T) * jx["half"]
+        return (
+            block.values.sum() * jx["energy"],
+            (forces * jx["force"]).reshape(pos.shape),
+            virial.T * jx["energy"],
+            "",
+        )
+
+    def _verlet(self, k, x, c):
+        """Builds the Verlet list `k` (cutoff + skin) on the host, keeping its
+        indices on the device"""
+        import jax.numpy as jnp
+
+        options = self._pair_lists[k]
+        length = mta.unit_conversion_factor(
+            self.model.capabilities().length_unit, "angstrom"
+        )
+        i, j, S = vesin.NeighborList(
+            cutoff=options.cutoff * length + self.skin, full_list=options.full_list
+        ).compute(
+            points=np.asarray(x),
+            box=np.asarray(c),
+            periodic=self._pbc,
+            quantities="ijS",
+            copy=True,
+        )
+        samples = metatensor.Labels(
+            [
+                "first_atom",
+                "second_atom",
+                "cell_shift_a",
+                "cell_shift_b",
+                "cell_shift_c",
+            ],
+            np.column_stack([i, j, S]).astype(np.int32).reshape(-1, 5),
+        )
+        return dict(
+            host=(i, j, S),
+            samples=samples,
+            i=jnp.asarray(i.astype(np.int32)),
+            j=jnp.asarray(j.astype(np.int32)),
+            S=jnp.asarray(S.astype(x.dtype)),
+            x=x,
+            c=c,
+        )
+
+    def _moved(self, nl, x, c):
+        """Whether an atom moved, or the cell changed, by more than half the skin
+        since the list was built: one number read from the device"""
+        import jax.numpy as jnp
+
+        moved = jnp.max(jnp.abs(x - nl["x"])) + jnp.max(jnp.abs(c - nl["c"]))
+        moved = moved > self._jx["half_skin"]
+        if self._jx["overflow"] is not None:  # PET's per-atom edge capacity
+            moved = moved | self._jx["overflow"]
+        return bool(moved)
+
+    def _pad(self, nl):
+        """The pair arrays of the Verlet list `nl` padded to the capacity of the
+        compiled energy function, which is (re-)compiled when it overflows"""
+        import math
+
+        import jax.numpy as jnp
+
+        jx = self._jx
+        i, j, S = nl["host"]
+        n = len(self._types)
+        pbc = bool(self._pbc.any())
+        x, c = np.asarray(nl["x"]), np.asarray(nl["c"])
+        _, count = self.model.jax_pair_arrays(i, j, S, n, len(i) + 1, x, c, pbc)
+        if jx["capacity"] is None:
+            factor = self.pair_capacity_factor
+            jx["capacity"] = [math.ceil(factor * len(i)) + 1, math.ceil(factor * count)]
+        overflow = jx["overflow"] is not None and bool(jx["overflow"])
+        while len(i) >= jx["capacity"][0] or count > jx["capacity"][1] or overflow:
+            jx["capacity"] = [math.ceil(1.5 * c) for c in jx["capacity"]]
+            jx["fn"], jx["regrowths"], overflow = None, jx["regrowths"] + 1, False
+            info(
+                f"metatomic_core: pair capacity grown to {jx['capacity']}", self.verbose
+            )
+        if jx["fn"] is None:
+            jx["fn"] = self.model.jax_energy_function(
+                self._types, pbc, jx["capacity"][1]
+            )
+            jx["compiles"] += 1
+        arrays, _ = self.model.jax_pair_arrays(i, j, S, n, jx["capacity"][0])
+        nl["count"] = count
+        nl["pairs"] = {key: jnp.asarray(value) for key, value in arrays.items()}
