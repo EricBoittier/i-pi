@@ -495,12 +495,14 @@ class MetatomicCoreDriver(Dummy_driver):
             )
             (energy,) = self.model.evaluate([system], [self._energy])
         else:
-            system = mta.System("angstrom", jx["types"], x, c, jx["pbc"])
+            # in the model's dtype (e.g. float32 TorchScript models)
+            cast = lambda array: array.astype(self._dtype)  # noqa: E731
+            system = mta.System("angstrom", jx["types"], cast(x), cast(c), jx["pbc"])
             for options, samples, vectors in pairs:
                 system.add_pairs(
                     options,
                     metatensor.TensorBlock(
-                        vectors.reshape(-1, 3, 1),
+                        cast(vectors).reshape(-1, 3, 1),
                         samples,
                         [metatensor.Labels.range("xyz", 3)],
                         metatensor.Labels.range("distance", 1),
@@ -515,17 +517,18 @@ class MetatomicCoreDriver(Dummy_driver):
         block = energy.block()
         gradient = block.gradient("positions")
         atoms = np.asarray(gradient.samples.column("atom"))
-        forces = -gradient.values[..., 0]
+        forces = -jnp.asarray(gradient.values[..., 0], dtype=x.dtype)
         if not np.array_equal(atoms, np.arange(len(self._types))):
             forces = (
                 jnp.zeros((len(self._types), 3), forces.dtype).at[atoms].add(forces)
             )
         virial = jnp.zeros((3, 3), forces.dtype)
         if "strain" in block.gradients_list():
-            virial = -block.gradient("strain").values[..., 0].sum(axis=0)
+            strain = jnp.asarray(block.gradient("strain").values, dtype=x.dtype)
+            virial = -strain[..., 0].sum(axis=0)
             virial = (virial + virial.T) * jx["half"]
         return (
-            block.values.sum() * jx["energy"],
+            jnp.asarray(block.values, dtype=x.dtype).sum() * jx["energy"],
             (forces * jx["force"]).reshape(pos.shape),
             virial.T * jx["energy"],
             "",
