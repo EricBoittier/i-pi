@@ -644,15 +644,19 @@ class MetatomicCoreDriver(Dummy_driver):
         def call(x, c, state):
             moved = jnp.max(jnp.abs(x - state["x"])) + jnp.max(jnp.abs(c - state["c"]))
 
-            def rebuild(_):
+            def rebuild(state):
                 arrays, overflow = build(x, c)
-                return dict(
+                new = dict(
                     arrays=arrays,
                     x=x,
                     c=c,
                     overflow=overflow,
                     rebuilds=state["rebuilds"] + 1,
                 )
+                # a list that overflows its capacity is incomplete: keep the previous
+                # one, and raise the flag for the host to grow the capacity
+                old = dict(state, overflow=overflow)
+                return jax.lax.cond(overflow, lambda: old, lambda: new)
 
             state = jax.lax.cond(moved > half_skin, rebuild, lambda s: s, state)
             e, f, v, overflow = energy(x, c, **state["arrays"])
