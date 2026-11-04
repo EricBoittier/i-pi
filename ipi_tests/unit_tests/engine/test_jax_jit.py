@@ -135,3 +135,70 @@ def test_changed_parameters_stop_the_compiled_steps(
     setattr(obj, name, getattr(obj, name) * 1.1)
     with pytest.raises(JitError, match="cannot change"):
         sim.run_step(4)
+
+
+# a harmonic driver on JAX arrays that cannot be traced: it reads its inputs
+# as numpy arrays, which fails on the tracers of jax.jit
+UNTRACEABLE = """
+import numpy as np
+import jax.numpy as jnp
+from ipi.pes.dummy import Dummy_driver
+
+__DRIVER_NAME__ = "untraceable"
+__DRIVER_CLASS__ = "Untraceable"
+CALLS = []
+
+
+class Untraceable(Dummy_driver):
+    backend_arrays = True
+    traceable = False
+
+    def check_parameters(self):
+        # device constants: Python scalars would be copied to the device
+        self.k, self.zero = jnp.asarray(1e-3), jnp.zeros((3, 3))
+
+    def compute_structure(self, cell, pos):
+        CALLS.append(np.asarray(pos).copy())
+        kx = self.k * pos
+        return jnp.vdot(kx, pos) / (self.k / self.k + self.k / self.k), -kx, self.zero, ""
+"""
+
+
+@pytest.mark.parametrize("case", ["nve", "nvt_svr", "npt_isotropic"])
+def test_untraceable_drivers_run_eagerly_in_compiled_steps(
+    case, tmp_path, monkeypatch, numpy_afterwards
+):
+    """A driver that works on JAX arrays but cannot be traced is called eagerly
+    at each compiled step, on the current positions, without host transfers,
+    and gives the trajectory of the eager steps"""
+
+    import sys
+
+    import jax
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "untraceable.py").write_text(UNTRACEABLE)
+    forcefield = (
+        "<ffdirect name='ff'><pes>custom</pes>"
+        f"<pes_path>{tmp_path / 'untraceable.py'}</pes_path></ffdirect>",
+        "<force forcefield='ff'/>",
+    )
+    xml = write_input(case, forcefield)
+    eager, compiled = simulation(xml, False), simulation(xml, True)
+    # the module of the driver of the compiled simulation, loaded last
+    calls = sys.modules["untraceable"].CALLS
+    for step in range(4):
+        eager.run_step(step)
+        compiled.run_step(step)
+    assert jit_step(compiled).compiled is not None
+    before = len(calls)
+    for step in range(4, 8):
+        eager.run_step(step)
+        with jax.transfer_guard("disallow"):
+            compiled.run_step(step)
+    assert_same_state(eager, compiled)
+    # one eager call per compiled step, on the positions of that step
+    assert len(calls) == before + 4
+    np.testing.assert_allclose(
+        calls[-1].reshape(-1), ab.to_numpy(compiled.syslist[0].beads.q).reshape(-1)
+    )

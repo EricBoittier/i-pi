@@ -47,15 +47,19 @@ def split(obj):
         depend._recorder.split(obj)
 
 
-def eager(func, *args):
+def eager(func, *args, traced=True):
     """Returns func(*args). While a function is recorded as CUDA graphs, the
     call is not recorded, and it is made again at each replay: `func` must
     return a list (possibly of lists), whose tensors are then copied into the
-    ones returned while recording, and whose other items replace theirs."""
+    ones returned while recording, and whose other items replace theirs.
+    With JAX, the call is traced as part of the compiled function, unless
+    `traced` is False: `func` then runs eagerly within the compiled function,
+    on the arrays it is given, and must return arrays of the same shapes and
+    types at each call (see `JitReplay.call`)."""
 
     if depend._recorder is None:
         return func(*args)
-    return depend._recorder.call(func, *args)
+    return depend._recorder.call(func, *args, traced=traced)
 
 
 def compiled(func):

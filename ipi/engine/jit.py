@@ -17,8 +17,10 @@ a graph changes.
 
 With JAX, the whole step is compiled, including the requests to direct
 forcefields whose driver works on the arrays of the backend (e.g. the `dummy`
-potential), which must then be written with JAX operations. The steps that
-need forces from other forcefields run eagerly.
+potential), which are traced if the driver is written with JAX operations, and
+otherwise (`traceable = False`) called eagerly within the compiled step, on the
+arrays of the device. The steps that need forces from other forcefields run
+eagerly.
 """
 
 # This file is part of i-PI.
