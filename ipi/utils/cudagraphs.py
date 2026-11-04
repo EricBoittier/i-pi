@@ -156,9 +156,9 @@ class GraphReplay:
         if the point described by `obj` must run eagerly: does nothing, and is
         overridden by the classes that replay specific functions."""
 
-    def call(self, func, *args):
+    def call(self, func, *args, traced=True):
         """Interrupts the recording to call `func(*args)` eagerly, and returns
-        the outputs."""
+        the outputs. Eager calls are never recorded, whether `traced` or not."""
 
         call = _Call(func, args)
         self.interrupt(call)

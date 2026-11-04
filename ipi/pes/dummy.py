@@ -21,6 +21,12 @@ class Dummy_driver(object):
     # call, as they may be overwritten (e.g. when replaying CUDA graphs).
     backend_arrays = False
 
+    # for drivers with backend arrays: whether `compute` can be traced with
+    # jax.jit, i.e. uses only JAX operations, when the steps are compiled with
+    # the jax backend (--jit). A driver that cannot be traced is called eagerly
+    # within the compiled steps, on the device arrays, which it must not keep.
+    traceable = True
+
     def __init__(self, verbose=False, *args, **kwargs):
         """Initialized dummy drivers"""
         self.verbose = verbose

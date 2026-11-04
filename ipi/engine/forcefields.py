@@ -80,9 +80,13 @@ class ForceField:
         _threadlock: Python handle used to lock the thread held in _thread.
         backend_arrays: Whether requests carry, and results are, arrays of the
             array backend (e.g. torch tensors on a GPU) rather than numpy arrays.
+        traceable: Whether the driver of a forcefield that works on the arrays
+            of the backend is traced in the steps compiled with jax.jit, rather
+            than called eagerly within them.
     """
 
     backend_arrays = False
+    traceable = True
 
     def __init__(
         self,
@@ -563,6 +567,7 @@ class FFDirect(ForceField):
             print("Error trace: ")
             raise err
         self.backend_arrays = getattr(self.driver, "backend_arrays", False)
+        self.traceable = getattr(self.driver, "traceable", True)
 
     def poll(self):
         """Polls the forcefield checking if there are requests that should
@@ -589,6 +594,26 @@ class FFDirect(ForceField):
                     self._batch_idle_cycles += 1
                 if self._batch_idle_cycles >= self._batch_idle_threshold:
                     self.launch_batch()
+
+    def _evaluate(self, cell, pos):
+        """Returns the processed results of the driver on a structure, or on
+        lists of structures. The calls to a driver that cannot be traced run
+        eagerly within the steps compiled with jax.jit, and the results are
+        processed in the compiled step."""
+
+        if self.traceable:
+            return jit.eager(self._results, cell, pos)
+        results = jit.eager(self._driver, cell, pos, traced=False)
+        if isinstance(cell, list):
+            return [self._process_results(r) for r in results]
+        return self._process_results(results)
+
+    def _driver(self, cell, pos):
+        """The results of the driver, as lists, as `jit.eager` needs them."""
+
+        if isinstance(cell, list):
+            return [list(r) for r in self.driver(cell, pos)]
+        return list(self.driver(cell, pos))
 
     def _results(self, cell, pos):
         """Evaluates the driver on a structure, or on lists of structures, and
@@ -625,7 +650,7 @@ class FFDirect(ForceField):
         cell_batch = [r["cell"][0] for r in self.request_batch]
         pos_batch = [r["pos"].reshape(-1, 3) for r in self.request_batch]
         # the driver is not part of the CUDA graphs that record a step
-        results_batch = jit.eager(self._results, cell_batch, pos_batch)
+        results_batch = self._evaluate(cell_batch, pos_batch)
         for results, request in zip(results_batch, self.request_batch):
             self._finish(request, results)
         self.request_batch = []
@@ -634,9 +659,7 @@ class FFDirect(ForceField):
     def evaluate(self, request):
         if self.batch_size == 1:
             # the driver is not part of the CUDA graphs that record a step
-            results = jit.eager(
-                self._results, request["cell"][0], request["pos"].reshape(-1, 3)
-            )
+            results = self._evaluate(request["cell"][0], request["pos"].reshape(-1, 3))
             self._finish(request, results)
         else:
             self.request_batch.append(request)
