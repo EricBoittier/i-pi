@@ -62,6 +62,12 @@ class MetatomicCoreDriver(Dummy_driver):
             before the model is constructed (JAX models cast their parameters to
             ``float64`` on construction)
         :param skin: float, optional, neighbor list skin in Angstrom (default 2.0)
+        :param array: str, optional, array type given to the model: ``numpy``
+            (default, host arrays), ``torch`` (torch tensors on ``device``) or ``jax``
+            (JAX arrays on JAX's default device). Device arrays avoid the host
+            round-trip for models that run on a GPU (TorchScript, JAX); native
+            plugins copy host arrays to their own device.
+        :param device: str, optional, torch device for ``array=torch`` (default cuda)
     """
 
     def __init__(
@@ -74,6 +80,8 @@ class MetatomicCoreDriver(Dummy_driver):
         check_consistency=False,
         enable_x64=True,
         skin=2.0,
+        array="numpy",
+        device="cuda",
         *args,
         **kwargs,
     ):
@@ -103,6 +111,10 @@ class MetatomicCoreDriver(Dummy_driver):
         self.check_consistency = _as_bool(check_consistency)
         self.enable_x64 = _as_bool(enable_x64)
         self.skin = float(skin)
+        self.array = str(array)
+        self.device = str(device)
+        if self.array not in ("numpy", "torch", "jax"):
+            raise ValueError(f"array must be numpy, torch or jax, got {self.array}")
         super().__init__(*args, **kwargs)
 
     def check_parameters(self):
@@ -233,6 +245,18 @@ class MetatomicCoreDriver(Dummy_driver):
             gradients=gradients,
         )
 
+    def _arr(self, x, dtype=None):
+        x = np.ascontiguousarray(x, dtype=dtype)
+        if self.array == "torch":
+            import torch
+
+            return torch.as_tensor(x, device=self.device)
+        if self.array == "jax":
+            import jax.numpy as jnp
+
+            return jnp.asarray(x)
+        return x
+
     def _system(self, cell, pos):
         positions = unit_to_user("length", "angstrom", pos).reshape(-1, 3)
         # i-PI stores cell vectors as columns, metatomic as rows
@@ -244,10 +268,10 @@ class MetatomicCoreDriver(Dummy_driver):
             )
         system = mta.System(
             "angstrom",
-            self._types.copy(),
-            np.ascontiguousarray(positions, dtype=self._dtype),
-            np.ascontiguousarray(cell, dtype=self._dtype),
-            self._pbc.copy(),
+            self._arr(self._types),
+            self._arr(positions, self._dtype),
+            self._arr(cell, self._dtype),
+            self._arr(self._pbc),
         )
         for options, neighbors in zip(self._pair_lists, self._neighbors):
             i, j, shifts, vectors = neighbors.compute(
@@ -268,7 +292,7 @@ class MetatomicCoreDriver(Dummy_driver):
                 np.column_stack([i, j, shifts]).astype(np.int32).reshape(-1, 5),
             )
             pairs = metatensor.TensorBlock(
-                np.ascontiguousarray(vectors, dtype=self._dtype).reshape(-1, 3, 1),
+                self._arr(vectors, self._dtype).reshape(-1, 3, 1),
                 samples,
                 [metatensor.Labels.range("xyz", 3)],
                 metatensor.Labels.range("distance", 1),
@@ -297,13 +321,12 @@ class MetatomicCoreDriver(Dummy_driver):
         np.add.at(energies, block.samples.column("system"), block.values[:, 0])
 
         gradient = block.gradient("positions")
-        forces = [np.zeros((len(self._types), 3)) for _ in systems]
-        for s, a, value in zip(
-            gradient.samples.column("system"),
-            gradient.samples.column("atom"),
-            np.asarray(gradient.values)[..., 0],
-        ):
-            forces[s][a] -= value
+        forces = np.zeros((n_systems, len(self._types), 3))
+        np.add.at(
+            forces,
+            (gradient.samples.column("system"), gradient.samples.column("atom")),
+            -np.asarray(gradient.values)[..., 0],
+        )
 
         virials = np.zeros((n_systems, 3, 3))
         if "strain" in block.gradients_list():
