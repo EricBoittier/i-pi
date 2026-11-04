@@ -434,7 +434,8 @@ class MetatomicCoreDriver(Dummy_driver):
         x = pos.reshape(-1, 3) * jx["length"]
         c = jnp.where(jx["pbc"][:, None], cell.T * jx["length"], jx["zero"])
         traced = isinstance(x, jax.core.Tracer)
-        if jx["lists"][0] is not None and self._pbc.any():
+        # (models such as native plugins may request no pair list)
+        if jx["lists"] and jx["lists"][0] is not None and self._pbc.any():
             # undo the folding of the positions into the cell since the list was
             # built (e.g. ffdirect pbc=true), which would invalidate its shifts
             device = jx.get("device")
