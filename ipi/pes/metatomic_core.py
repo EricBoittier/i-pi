@@ -640,8 +640,13 @@ class MetatomicCoreDriver(Dummy_driver):
         i, j, S = nl["host"]
         n = len(self._types)
         pbc = bool(self._pbc.any())
-        x, c = np.asarray(nl["x"]), np.asarray(nl["c"])
-        _, count = self.model.jax_pair_arrays(i, j, S, n, len(i) + 1, x, c, pbc)
+        count = 0
+        if jx["capacity"] is None:
+            # the per-atom edge count after PET's selection sizes the first capacity;
+            # later lists rely on the model's own overflow flag (computing it again
+            # would compile the selection for each new pair count)
+            x, c = np.asarray(nl["x"]), np.asarray(nl["c"])
+            _, count = self.model.jax_pair_arrays(i, j, S, n, len(i) + 1, x, c, pbc)
         if jx["capacity"] is None:
             factor = self.pair_capacity_factor
             jx["capacity"] = [math.ceil(factor * len(i)) + 1, math.ceil(factor * count)]
