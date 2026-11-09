@@ -17,12 +17,20 @@ The other inputs (e.g. the time step, held by a Python float) are fixed in
 the compiled function, and a `JitError` is raised if they change. Unlike CUDA
 graphs, the compiled function cannot be interrupted to run parts of the
 function eagerly: the calls to `eager` are traced, and the function is not
-compiled if it must be interrupted at a `split`.
+compiled if it must be interrupted at a `split`. The calls to `eager` with
+`traced=False` (e.g. to drivers that cannot be traced) run instead eagerly
+within the compiled function, through `jax.experimental.buffer_callback`: they
+get the arrays of the device without copies, and write their results directly
+into the buffers of the compiled function.
 """
 
 # This file is part of i-PI.
 # i-PI Copyright (C) 2014-2026 i-PI developers
 # See the "licenses" directory for full license information.
+
+import functools
+import os
+import threading
 
 import numpy as np
 
@@ -30,7 +38,19 @@ from ipi.utils import depend
 from ipi.utils.jit import WARMUP_CALLS, JitError, _Recorder
 from ipi.utils.messages import info, verbosity, warning
 
-__all__ = ["JitReplay"]
+__all__ = ["JitReplay", "in_untraced_call"]
+
+_untraced = threading.local()
+
+
+def in_untraced_call():
+    """Whether the calling code runs in an untraced eager call within a compiled
+    step. On a GPU, such code must not compile new XLA functions with the default
+    options: XLA's autotuning runs on the device, which waits for the call, and
+    deadlocks. Code that compiles there should disable it, e.g. with
+    ``jax.jit(f).lower(...).compile({"xla_gpu_autotune_level": 0})``."""
+
+    return getattr(_untraced, "active", False)
 
 
 class JitReplay:
@@ -55,6 +75,8 @@ class JitReplay:
         self.inputs = None
         # why the function cannot be compiled, if it cannot
         self.reason = None
+        # the results of the untraced eager calls, in the order of the calls
+        self.templates = []
 
     def __call__(self, *args):
         if self.compiled is not None:
@@ -72,6 +94,7 @@ class JitReplay:
         reads before writing them."""
 
         recorder = _Recorder(self)
+        self.templates = []
         depend.set_recorder(recorder)
         try:
             self.func(*args)
@@ -102,6 +125,7 @@ class JitReplay:
             if key is not None:
                 self.prng._jax_key = key
             self.recorder = _TraceRecorder(self, {dep._status for dep in self.inputs})
+            self.untraced = iter(self.templates)
             depend.set_recorder(self.recorder)
             try:
                 self.func(*args)
@@ -112,6 +136,27 @@ class JitReplay:
 
         try:
             self.compiled = jax.jit(traced).lower(key, arrays).compile()
+            self.donated = None
+            if os.environ.get("IPI_JAX_DONATE"):
+                # experimental: donate the buffers of the inputs that the step
+                # overwrites (e.g. positions and momenta), found by the first trace
+                written = {id(dep._root()) for dep in self.outputs}
+                self.donated = [id(dep._root()) in written for dep in self.arrays]
+
+                def split(key, donated, kept):
+                    d, k = iter(donated), iter(kept)
+                    return traced(
+                        key, [next(d) if m else next(k) for m in self.donated]
+                    )
+
+                parts = self._split(arrays)
+                self.compiled = (
+                    jax.jit(split, donate_argnums=(1,)).lower(key, *parts).compile()
+                )
+                info(
+                    f" @jaxjit: donating {sum(self.donated)} of {len(arrays)} inputs",
+                    verbosity.low,
+                )
         except Exception as err:
             raise JitError(
                 "The step cannot be compiled with jax.jit: run i-PI without --jit"
@@ -153,7 +198,10 @@ class JitReplay:
 
         import jax
 
-        key, results = self.compiled(key, arrays)
+        if self.donated is not None:
+            key, results = self.compiled(key, *self._split(arrays))
+        else:
+            key, results = self.compiled(key, arrays)
         if key is not None:
             self.prng._jax_key = key
         results = iter(results)
@@ -162,6 +210,20 @@ class JitReplay:
             self.outputs, jax.tree_util.tree_unflatten(self.treedef, leaves)
         ):
             dep._store(value)
+
+    def _split(self, arrays):
+        """The inputs that are donated, and the others"""
+
+        import jax.numpy as jnp
+
+        kept = [a for a, m in zip(arrays, self.donated) if not m]
+        seen, donated = {id(a) for a in kept}, []
+        for a, m in zip(arrays, self.donated):
+            if m:
+                # an array held by several depend objects is donated once
+                donated.append(jnp.copy(a) if id(a) in seen else a)
+                seen.add(id(a))
+        return donated, kept
 
     def replay(self):
         """Calls the compiled function on the current values of the inputs, and
@@ -197,11 +259,20 @@ class JitReplay:
         else:
             raise JitError(f"The step cannot be compiled: {reason}")
 
-    def call(self, func, *args):
+    def call(self, func, *args, traced=True):
         """Called by `eager(func, *args)`: the call is traced as part of the
-        function."""
+        function, unless `traced` is False. Then, the eager call made while the
+        function is observed gives the structure, shapes and types of the
+        results, and the compiled function calls `func` eagerly at each call
+        (see `_untraced_call`)."""
 
-        return func(*args)
+        if traced:
+            return func(*args)
+        if self.inputs is None:
+            outputs = func(*args)
+            self.templates.append(outputs)
+            return outputs
+        return _untraced_call(func, args, next(self.untraced))
 
 
 class _TraceRecorder(_Recorder):
@@ -225,6 +296,118 @@ class _TraceRecorder(_Recorder):
         super().tainted(dep, taintme)
         if not taintme and isinstance(dep, depend.depend_array):
             self.arrays[dep._root()] = None
+
+
+def _untraced_call(func, args, template):
+    """Calls `func(*args)` eagerly within the traced function, through
+    jax.experimental.buffer_callback, and returns its results, which have the
+    structure, shapes and types of `template`. The JAX arrays of `args` are
+    given to `func` as views of the buffers of the compiled function (through
+    DLPack), and the JAX arrays it returns are copied into the buffers of the
+    results, on the device. Its other results are fixed to those of
+    `template`."""
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.buffer_callback import buffer_callback
+
+    tree = jax.tree_util
+    leaves, treedef = tree.tree_flatten(args)
+    traced = [i for i, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
+    fixed, results_def = tree.tree_flatten(template)
+    arrays = [i for i, leaf in enumerate(fixed) if _is_jax(leaf)]
+
+    def callback(ctx, outs, *buffers):
+        stream = _synchronize(ctx)
+        views = list(leaves)
+        for i, buffer in zip(traced, buffers):
+            views[i] = jnp.from_dlpack(buffer)
+        _untraced.active = True
+        try:
+            values = tree.tree_leaves(func(*tree.tree_unflatten(treedef, views)))
+        finally:
+            _untraced.active = False
+        if any(
+            not _equal(values[i], fixed[i])
+            for i in range(len(fixed))
+            if i not in arrays
+        ):
+            raise JitError(
+                "An eager call in the compiled step returned a value that is not "
+                "an array, and differs from the one it returned in the eager step"
+            )
+        for out, i in zip(outs, arrays):
+            _write(out, values[i], stream)
+        _synchronize(ctx)
+
+    shapes = [jax.ShapeDtypeStruct(fixed[i].shape, fixed[i].dtype) for i in arrays]
+    computed = iter(buffer_callback(callback, shapes)(*[leaves[i] for i in traced]))
+    results = [next(computed) if i in arrays else leaf for i, leaf in enumerate(fixed)]
+    return tree.tree_unflatten(results_def, results)
+
+
+def _synchronize(ctx):
+    """Waits for the operations queued on the stream of a buffer_callback, on
+    a GPU, and returns the stream (None on a CPU)."""
+
+    try:
+        stream = ctx.stream
+    except Exception:  # not on a GPU
+        return None
+    if stream:
+        _cudart().cudaStreamSynchronize(stream)
+    return stream
+
+
+def _write(out, value, stream):
+    """Copies the JAX array `value` into the buffer `out` of a buffer_callback,
+    without leaving the device."""
+
+    import jax.numpy as jnp
+
+    value = jnp.asarray(value, dtype=out.dtype).reshape(out.shape)
+    if stream is None:
+        np.asarray(out)[...] = np.asarray(value)
+        return
+    value.block_until_ready()
+    device_to_device = 3
+    status = _cudart().cudaMemcpyAsync(
+        out.__cuda_array_interface__["data"][0],
+        value.unsafe_buffer_pointer(),
+        value.nbytes,
+        device_to_device,
+        stream,
+    )
+    if status != 0:
+        raise JitError(f"cudaMemcpyAsync failed with error {status}")
+
+
+@functools.cache
+def _cudart():
+    """The CUDA runtime library used by JAX."""
+
+    import ctypes
+    import ctypes.util
+    import glob
+    import os
+
+    try:
+        import nvidia.cuda_runtime
+
+        directory = os.path.join(nvidia.cuda_runtime.__path__[0], "lib")
+        path = sorted(glob.glob(os.path.join(directory, "libcudart.so*")))[0]
+    except (ImportError, IndexError):
+        path = ctypes.util.find_library("cudart")
+    lib = ctypes.CDLL(path)
+    lib.cudaMemcpyAsync.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+    return lib
 
 
 def _get(dep):
